@@ -1,0 +1,155 @@
+scilla_version 0
+
+library VantaBlackSharkLib
+
+let one_msg = 
+  fun (msg : Message) => 
+  let nil_msg = Nil {Message} in
+  Cons {Message} msg nil_msg
+
+let le_int =
+  fun (a : Uint128) =>
+  fun (b : Uint128) =>
+    let x = builtin lt a b in
+    match x with
+    | True => True
+    | False =>
+      let y = builtin eq a b in
+      match y with
+      | True => True
+      | False => False
+      end
+    end
+
+(* Error events *)
+let mk_error_event =
+  fun (ename : String) =>
+  fun (ecode : Int32) =>
+    { _eventname : ename; code : ecode }
+
+(* Error codes *)
+let code_success = Int32 0
+let code_failure = Int32 1
+let code_not_owner = Int32 2
+let code_insufficient_funds = Int32 3
+let code_insufficient_allowance = Int32 4
+
+contract VantaBlackShark
+()
+
+(* Mutable fields *)
+
+field name : String = "VantaBlackShark"
+field symbol : String = "VBS"
+field decimals : Uint32 = Uint32 6
+
+field total_supply : Uint128 = Uint128 10000000
+
+field balances : Map ByStr20 Uint128 =
+  let emp_map = Emp ByStr20 Uint128 in
+  let init_supply = Uint128 10000000 in
+  let contract_owner = 0x7959C27Af22E43fa88D0CBCac269c35bEa45DB1B in
+  builtin put emp_map contract_owner init_supply
+
+field allowances : Map ByStr20 (Map ByStr20 Uint128) = Emp ByStr20 (Map ByStr20 Uint128)
+
+(* Procedures *)
+
+procedure ThrowError(ename : String, ecode : Int32)
+  e = mk_error_event ename ecode;
+  event e;
+  err = { _exception : ename; code : ecode };
+  throw err
+end
+
+procedure AuthorizedMoveIfSufficientBalance(from: ByStr20, to: ByStr20, amount: Uint128)
+  get_bal <- balances[from];
+  match get_bal with
+  | Some bal =>
+    can_do = le_int amount bal;
+    match can_do with
+    | True =>
+      (* Subtract from sender *)
+      new_from_bal = builtin sub bal amount;
+      balances[from] := new_from_bal;
+      (* Add to receiver *)
+      get_to_bal <- balances[to];
+      new_to_bal = match get_to_bal with
+      | Some r => builtin add r amount
+      | None => amount
+      end;
+      balances[to] := new_to_bal;
+      (* Emit event *)
+      e = {_eventname : "TransferSuccess"; sender : from; recipient : to; amount : amount};
+      event e;
+      (* Msg to recipient *)
+      msg = {_tag : "RecipientAcceptTransfer"; _recipient : to; _amount : Uint128 0; 
+             sender : from; recipient : to; amount : amount};
+      msgs = one_msg msg;
+      send msgs
+    | False =>
+      (* Insufficient balance *)
+      ThrowError "TransferFailure" code_insufficient_funds
+    end
+  | None =>
+    ThrowError "TransferFailure" code_insufficient_funds
+  end
+end
+
+(* Transitions *)
+
+(* @dev: Moves an amount of tokens from _sender to the recipient. *)
+transition Transfer(to: ByStr20, amount: Uint128)
+  AuthorizedMoveIfSufficientBalance _sender to amount
+end
+
+(* @dev: Moves an amount of tokens from from to to using the allowance mechanism. *)
+transition TransferFrom(from: ByStr20, to: ByStr20, amount: Uint128)
+  get_spender_allowance <- allowances[from][_sender];
+  current_allowance = match get_spender_allowance with
+  | Some v => v
+  | None => Uint128 0
+  end;
+  can_do = le_int amount current_allowance;
+  match can_do with
+  | True =>
+    (* Reduce allowance *)
+    new_allowance = builtin sub current_allowance amount;
+    allowances[from][_sender] := new_allowance;
+    (* Move funds *)
+    AuthorizedMoveIfSufficientBalance from to amount
+  | False =>
+    ThrowError "TransferFromFailure" code_insufficient_allowance
+  end
+end
+
+(* @dev: Sets the allowance of a spender. *)
+transition IncreaseAllowance(spender: ByStr20, amount: Uint128)
+  get_current <- allowances[_sender][spender];
+  current = match get_current with
+  | Some v => v
+  | None => Uint128 0
+  end;
+  new_allowance = builtin add current amount;
+  allowances[_sender][spender] := new_allowance;
+  e = {_eventname : "IncreasedAllowance"; owner : _sender; spender : spender; new_allowance : new_allowance};
+  event e
+end
+
+(* @dev: Decreases the allowance of a spender. *)
+transition DecreaseAllowance(spender: ByStr20, amount: Uint128)
+  get_current <- allowances[_sender][spender];
+  current = match get_current with
+  | Some v => v
+  | None => Uint128 0
+  end;
+  new_allowance =
+    let c = le_int amount current in
+    match c with
+    | True => builtin sub current amount
+    | False => Uint128 0
+    end;
+  allowances[_sender][spender] := new_allowance;
+  e = {_eventname : "DecreasedAllowance"; owner : _sender; spender : spender; new_allowance : new_allowance};
+  event e
+end
